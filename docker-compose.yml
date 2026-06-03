@@ -1,0 +1,19 @@
+services:
+  anthropic-cache-proxy:
+    build: .
+    image: anthropic-cache-proxy:latest
+    container_name: anthropic-cache-proxy
+    restart: unless-stopped
+    environment:
+      PORT: "8080"
+      UPSTREAM_URL: "https://api.anthropic.com"
+    # En producción dentro de EasyPanel NO publiques el puerto al exterior:
+    # déjalo accesible solo en la red interna del proyecto. Esta sección de
+    # 'ports' es únicamente para pruebas locales.
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "/proxy", "-health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
