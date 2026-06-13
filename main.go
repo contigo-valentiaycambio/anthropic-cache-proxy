@@ -2,10 +2,10 @@
 //
 // Proxy transparente que se sienta entre n8n y la API de Anthropic.
 // Su único trabajo: interceptar las peticiones POST /v1/messages, inyectar
-// el marcador `cache_control: { "type": "ephemeral" }` sobre el bloque de
-// system prompt (o, si no hay system, sobre la última herramienta) y reenviar
-// todo lo demás SIN modificar. Las respuestas —incluido el streaming SSE—
-// se transmiten tal cual, sin tocar.
+// el marcador `cache_control: { "type": "ephemeral", "ttl": "1h" }` sobre el
+// bloque de system prompt (o, si no hay system, sobre la última herramienta)
+// y reenviar todo lo demás SIN modificar. Las respuestas —incluido el
+// streaming SSE— se transmiten tal cual, sin tocar.
 //
 // El AI Agent de n8n y todas sus herramientas siguen funcionando igual:
 // solo hay que apuntar la "Base URL" de la credencial de Anthropic a este proxy.
@@ -13,6 +13,9 @@
 // La API key NUNCA se almacena aquí: n8n la envía en la cabecera x-api-key y
 // el proxy simplemente la reenvía. Por eso este servicio debe permanecer en la
 // red interna (no expuesto públicamente).
+//
+// TTL de caché: por defecto 1 hora (env CACHE_TTL=1h). Para volver al
+// comportamiento de 5 minutos sin tocar código: CACHE_TTL=5m y redeploy.
 //
 // Solo biblioteca estándar. Sin dependencias externas.
 package main
@@ -58,9 +61,19 @@ func getenv(key, def string) string {
 	return def
 }
 
+// betaExtendedTTL: header legado del TTL extendido. Ya no es obligatorio
+// en la API directa, pero incluirlo es inofensivo y blinda contra cambios
+// silenciosos de defaults (como el de marzo 2026).
+const betaExtendedTTL = "extended-cache-ttl-2025-04-11"
+
 // ephemeral es el marcador de caché que Anthropic reconoce.
+// TTL configurable vía env CACHE_TTL: "1h" (default) o "5m".
 func ephemeral() map[string]any {
-	return map[string]any{"type": "ephemeral"}
+	cc := map[string]any{"type": "ephemeral"}
+	if getenv("CACHE_TTL", "1h") == "1h" {
+		cc["ttl"] = "1h"
+	}
+	return cc
 }
 
 // hasCacheControl indica si algún bloque de la lista ya trae cache_control,
@@ -190,6 +203,14 @@ func main() {
 			if upstream.Path != "" && upstream.Path != "/" {
 				req.URL.Path = strings.TrimRight(upstream.Path, "/") + req.URL.Path
 			}
+			// TTL extendido: declarar el beta header de forma idempotente.
+			if getenv("CACHE_TTL", "1h") == "1h" {
+				if b := req.Header.Get("anthropic-beta"); b == "" {
+					req.Header.Set("anthropic-beta", betaExtendedTTL)
+				} else if !strings.Contains(b, betaExtendedTTL) {
+					req.Header.Set("anthropic-beta", b+","+betaExtendedTTL)
+				}
+			}
 		},
 		// FlushInterval -1 = vaciar inmediatamente cada chunk: imprescindible
 		// para que el streaming SSE llegue token a token sin buffering.
@@ -225,7 +246,7 @@ func main() {
 			// Evitar Content-Length obsoleto: el Transport lo recalcula.
 			r.Header.Del("Content-Length")
 			if changed {
-				log.Printf("cache_control inyectado (%d -> %d bytes)", len(body), len(newBody))
+				log.Printf("cache_control inyectado, ttl=%s (%d -> %d bytes)", getenv("CACHE_TTL", "1h"), len(body), len(newBody))
 			}
 		}
 		proxy.ServeHTTP(w, r)
@@ -239,7 +260,7 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 	}
 
-	log.Printf("anthropic-cache-proxy escuchando en :%s -> %s", port, upstream.String())
+	log.Printf("anthropic-cache-proxy escuchando en :%s -> %s (cache ttl=%s)", port, upstream.String(), getenv("CACHE_TTL", "1h"))
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("servidor detenido: %v", err)
 	}
