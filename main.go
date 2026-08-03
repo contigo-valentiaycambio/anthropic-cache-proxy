@@ -17,11 +17,16 @@
 // TTL de caché: por defecto 1 hora (env CACHE_TTL=1h). Para volver al
 // comportamiento de 5 minutos sin tocar código: CACHE_TTL=5m y redeploy.
 //
+// Mantenimiento del caché (keepwarm.go): con KEEPWARM_ENABLED=true, el proxy
+// reenvía cada ~50 min el mismo prefijo para que el TTL no expire en los huecos
+// de la jornada. Ver keepwarm.go.
+//
 // Solo biblioteca estándar. Sin dependencias externas.
 package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -175,6 +180,14 @@ func main() {
 		log.Fatalf("UPSTREAM_URL inválida (%q): %v", upstreamRaw, err)
 	}
 
+	// ── keepwarm: mantenimiento del caché (ver keepwarm.go) ──
+	// Se apaga con KEEPWARM_ENABLED=false; sin esa variable en "true" el
+	// módulo solo observa y nunca envía nada.
+	warm := newWarmer(port)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	warm.Start(ctx)
+
 	// Transport afinado para conexiones largas de LLM: sin timeout global,
 	// pero con protecciones razonables de conexión.
 	transport := &http.Transport{
@@ -230,6 +243,12 @@ func main() {
 		_, _ = io.WriteString(w, "ok")
 	})
 
+	// Diagnóstico del pinger: estado, último cache_read, fallos.
+	mux.HandleFunc("/keepwarm/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		_ = json.NewEncoder(w).Encode(warm.Status())
+	})
+
 	// Catch-all: transforma /v1/messages, deja pasar el resto.
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if shouldTransform(r) {
@@ -241,6 +260,12 @@ func main() {
 				return
 			}
 			newBody, changed := transformBody(body)
+			// keepwarm: capturar el prefijo EXACTO que sale hacia Anthropic.
+			// Los pings del propio módulo se excluyen (traen la cabecera) para
+			// que no se cuenten como tráfico real de pacientes.
+			if r.Header.Get(keepwarmHeader) == "" {
+				warm.Observe(newBody, r.Header)
+			}
 			r.Body = io.NopCloser(bytes.NewReader(newBody))
 			r.ContentLength = int64(len(newBody))
 			// Evitar Content-Length obsoleto: el Transport lo recalcula.
