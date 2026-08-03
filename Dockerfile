@@ -2,7 +2,7 @@
 FROM golang:1.23-alpine AS build
 WORKDIR /src
 COPY go.mod ./
-COPY main.go ./
+COPY *.go ./
 # Binario estático, sin CGO, optimizado en tamaño.
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /proxy .
 
