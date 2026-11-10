@@ -70,6 +70,17 @@ Regla práctica: si tras una semana el ratio de lectura en caché está por deba
 
 ---
 
+## Caché de mensajes (segundo breakpoint)
+
+Además del system prompt (TTL 1 h), el proxy marca el **último bloque del último mensaje** con `cache_control` de 5 minutos. En cada turno el agente de n8n llama varias veces a la API (respuesta → herramienta → resultado → respuesta final); con este marcador, la segunda y siguientes llamadas releen a precio de caché el historial, el contexto dinámico y los resultados de herramientas que ya enviaron, en vez de pagarlos completos.
+
+| Variable | Default | Efecto |
+|---|---|---|
+| `CACHE_MESSAGES` | `true` | `false` lo apaga (solo queda el breakpoint del system) |
+| `CACHE_MESSAGES_TTL` | `5m` | `1h` solo si `CACHE_TTL=1h`; la API no admite un TTL largo después de uno corto |
+
+Los pings del keepwarm no llevan este segundo marcador. En los logs, cada petición muestra `mensajes=true`. En la Console, el efecto se ve como menos *Input* y algo de *Prompt caching write (5m)* (1,25× el precio de input, solo sobre lo nuevo de cada llamada).
+
 ## Notas importantes
 
 - **Seguridad**: el proxy reenvía la API key que envía n8n; no la guarda. Manténlo en la red interna, sin dominio público. Si algún día lo expones, ponle al menos una cabecera/secreto de acceso.

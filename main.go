@@ -17,6 +17,13 @@
 // TTL de caché: por defecto 1 hora (env CACHE_TTL=1h). Para volver al
 // comportamiento de 5 minutos sin tocar código: CACHE_TTL=5m y redeploy.
 //
+// Segundo breakpoint (nov-2026): con CACHE_MESSAGES=true (default) se marca
+// también el ÚLTIMO bloque del último mensaje, con TTL de 5 minutos. Así cada
+// iteración del agente (tool_use -> tool_result -> respuesta) relee a precio
+// de caché el historial, el contexto dinámico y los resultados de herramientas
+// que ya envió en la iteración anterior, en vez de pagarlos completos.
+// Se apaga con CACHE_MESSAGES=false y redeploy. Ver cacheLastMessage().
+//
 // Mantenimiento del caché (keepwarm.go): con KEEPWARM_ENABLED=true, el proxy
 // reenvía cada ~50 min el mismo prefijo para que el TTL no expire en los huecos
 // de la jornada. Ver keepwarm.go.
@@ -94,16 +101,92 @@ func hasCacheControl(blocks []any) bool {
 	return false
 }
 
-// transformBody inyecta el breakpoint de caché. Devuelve el cuerpo modificado
-// y true si lo modificó. Si algo no calza (no es JSON, no hay system ni tools),
-// devuelve el cuerpo original intacto y false.
+// ephemeralMessages es el marcador del segundo breakpoint (mensajes).
+// Anthropic exige que un TTL largo nunca vaya DESPUÉS de uno corto; el system
+// (1h) va antes que los mensajes, así que aquí basta con 5m. Con
+// CACHE_MESSAGES_TTL=1h se iguala al del system.
+func ephemeralMessages() map[string]any {
+	cc := map[string]any{"type": "ephemeral"}
+	if getenv("CACHE_MESSAGES_TTL", "5m") == "1h" && getenv("CACHE_TTL", "1h") == "1h" {
+		cc["ttl"] = "1h"
+	}
+	return cc
+}
+
+// cacheMessagesEnabled: segundo breakpoint activo salvo CACHE_MESSAGES=false.
+func cacheMessagesEnabled() bool {
+	return getenv("CACHE_MESSAGES", "true") != "false"
+}
+
+// cacheLastMessage marca con cache_control el último bloque del último
+// mensaje. Devuelve true si marcó. Reglas:
+//   - Si cualquier mensaje ya trae cache_control, no toca nada (idempotente y
+//     respeta al cliente si algún día marca él mismo).
+//   - Contenido string -> se convierte a [{type:text, text, cache_control}],
+//     que es equivalente para la API.
+//   - Bloques que la API no deja marcar (thinking, redacted_thinking) o
+//     bloques de texto vacíos: no se marca nada.
+func cacheLastMessage(data map[string]any) bool {
+	msgs, ok := data["messages"].([]any)
+	if !ok || len(msgs) == 0 {
+		return false
+	}
+	for _, m := range msgs {
+		mm, ok := m.(map[string]any)
+		if !ok {
+			return false
+		}
+		if blocks, ok := mm["content"].([]any); ok && hasCacheControl(blocks) {
+			return false
+		}
+	}
+	last, ok := msgs[len(msgs)-1].(map[string]any)
+	if !ok {
+		return false
+	}
+	switch c := last["content"].(type) {
+	case string:
+		if strings.TrimSpace(c) == "" {
+			return false
+		}
+		last["content"] = []any{
+			map[string]any{"type": "text", "text": c, "cache_control": ephemeralMessages()},
+		}
+		return true
+	case []any:
+		if len(c) == 0 {
+			return false
+		}
+		b, ok := c[len(c)-1].(map[string]any)
+		if !ok {
+			return false
+		}
+		switch b["type"] {
+		case "thinking", "redacted_thinking":
+			return false
+		case "text":
+			if t, _ := b["text"].(string); strings.TrimSpace(t) == "" {
+				return false
+			}
+		}
+		b["cache_control"] = ephemeralMessages()
+		return true
+	}
+	return false
+}
+
+// transformBody inyecta los breakpoints de caché. Devuelve el cuerpo
+// modificado y true si lo modificó. Si algo no calza (no es JSON, no hay
+// system ni tools), devuelve el cuerpo original intacto y false.
+// withMessages=false para los pings del keepwarm: su mensaje "ping" no debe
+// crear una entrada de caché propia (el ping la contaría como fallo).
 //
 // Estrategia: un único breakpoint sobre el system prompt. Como en el orden de
 // prefijo de Anthropic las tools van ANTES del system, marcar el system cachea
 // tools + system en un solo prefijo estable. El contenido dinámico (fecha,
 // contexto del paciente) viaja en el mensaje del usuario, DESPUÉS del
 // breakpoint, así que no invalida la caché.
-func transformBody(raw []byte) ([]byte, bool) {
+func transformBody(raw []byte, withMessages bool) ([]byte, bool) {
 	var data map[string]any
 	if err := json.Unmarshal(raw, &data); err != nil {
 		return raw, false // no es JSON: pasar tal cual
@@ -150,6 +233,12 @@ func transformBody(raw []byte) ([]byte, bool) {
 
 	if !marked {
 		return raw, false
+	}
+
+	// 3) Segundo breakpoint sobre el último mensaje (solo si el primero
+	// quedó puesto: sin prefijo cacheado no tiene sentido).
+	if withMessages && cacheMessagesEnabled() {
+		cacheLastMessage(data)
 	}
 
 	out, err := json.Marshal(data)
@@ -259,11 +348,12 @@ func main() {
 				http.Error(w, "bad request", http.StatusBadRequest)
 				return
 			}
-			newBody, changed := transformBody(body)
+			isPing := r.Header.Get(keepwarmHeader) != ""
+			newBody, changed := transformBody(body, !isPing)
 			// keepwarm: capturar el prefijo EXACTO que sale hacia Anthropic.
 			// Los pings del propio módulo se excluyen (traen la cabecera) para
 			// que no se cuenten como tráfico real de pacientes.
-			if r.Header.Get(keepwarmHeader) == "" {
+			if !isPing {
 				warm.Observe(newBody, r.Header)
 			}
 			r.Body = io.NopCloser(bytes.NewReader(newBody))
@@ -271,7 +361,7 @@ func main() {
 			// Evitar Content-Length obsoleto: el Transport lo recalcula.
 			r.Header.Del("Content-Length")
 			if changed {
-				log.Printf("cache_control inyectado, ttl=%s (%d -> %d bytes)", getenv("CACHE_TTL", "1h"), len(body), len(newBody))
+				log.Printf("cache_control inyectado, ttl=%s mensajes=%v (%d -> %d bytes)", getenv("CACHE_TTL", "1h"), !isPing && cacheMessagesEnabled(), len(body), len(newBody))
 			}
 		}
 		proxy.ServeHTTP(w, r)
@@ -285,7 +375,7 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 	}
 
-	log.Printf("anthropic-cache-proxy escuchando en :%s -> %s (cache ttl=%s)", port, upstream.String(), getenv("CACHE_TTL", "1h"))
+	log.Printf("anthropic-cache-proxy escuchando en :%s -> %s (cache ttl=%s, cache mensajes=%v ttl=%s)", port, upstream.String(), getenv("CACHE_TTL", "1h"), cacheMessagesEnabled(), getenv("CACHE_MESSAGES_TTL", "5m"))
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("servidor detenido: %v", err)
 	}
